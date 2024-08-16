@@ -18,7 +18,7 @@ DEFAULT_WKID = 4326
 
 
 class ArcGIS(Geocoder):
-    """Geocoder using the ERSI ArcGIS API.
+    """Geocoder using the ESRI ArcGIS API.
 
     Documentation at:
         https://developers.arcgis.com/rest/geocode/api-reference/overview-world-geocoding-service.htm
@@ -34,6 +34,7 @@ class ArcGIS(Geocoder):
             self,
             username=None,
             password=None,
+            token=None,
             *,
             referer=None,
             token_lifetime=60,
@@ -53,6 +54,9 @@ class ArcGIS(Geocoder):
 
         :param str password: ArcGIS password. Required if authenticated
             mode is desired.
+
+        :param str token: ArcGIS API for Python token. If provided, used
+            for authentication instead of username/password.
 
         :param str referer: Required if authenticated mode is desired.
             `Referer` HTTP header to send with each request,
@@ -100,19 +104,18 @@ class ArcGIS(Geocoder):
             ssl_context=ssl_context,
             adapter_factory=adapter_factory,
         )
-        if username or password or referer:
-            if not (username and password and referer):
-                raise ConfigurationError(
-                    "Authenticated mode requires username,"
-                    " password, and referer"
-                )
-            if self.scheme != 'https':
-                raise ConfigurationError(
-                    "Authenticated mode requires scheme of 'https'"
-                )
+        if (username or password or referer) and not (username and password and referer):
+            raise ConfigurationError(
+                "Authenticated mode requires username, password, and referer"
+            )
+        if token and self.scheme != 'https':
+            raise ConfigurationError(
+                "Authenticated mode with token requires scheme of 'https'"
+            )
 
         self.username = username
         self.password = password
+        self.token = token
         self.referer = referer
         self.auth_domain = auth_domain.strip('/')
         self.auth_api = (
@@ -130,7 +133,6 @@ class ArcGIS(Geocoder):
         )
 
         # Mutable state
-        self.token = None
         self.token_expiry = None
 
     def geocode(self, query, *, exactly_one=True, timeout=DEFAULT_SENTINEL,
@@ -232,97 +234,65 @@ class ArcGIS(Geocoder):
         if 'error' in response:
             # https://developers.arcgis.com/rest/geocode/api-reference/geocoding-service-output.htm
             if response['error']['code'] == 400:
-                # 'details': ['Unable to find address for the specified location.']}
-                try:
-                    if 'Unable to find' in response['error']['details'][0]:
-                        return None
-                except (KeyError, IndexError):
-                    pass
+                # 'details': ['Unable to find address for the specified location.']
+                return None
             raise GeocoderServiceError(str(response['error']))
+        address = response['address']
+        location = (response['location']['y'], response['location']['x'])
+        return Location(address['Match_addr'], location, address)
 
-        if response['address'].get('Address'):
-            address = (
-                "%(Address)s, %(City)s, %(Region)s %(Postal)s,"
-                " %(CountryCode)s" % response['address']
-            )
+    def _authenticated_call_geocoder(self, url, callback, *, timeout):
+        """
+        Call the geocoder with a (potentially refreshed) ArcGIS token.
+        """
+        if self.token:
+            # Use the provided token
+            auth_params = {'token': self.token, 'referer': self.referer}
         else:
-            address = response['address']['LongLabel']
+            if not self.token_expiry or time() >= self.token_expiry:
+                # Get a new token if the current one is expired or missing
+                self._refresh_authentication_token()
+            auth_params = {'token': self.token, 'referer': self.referer}
 
-        location = Location(
-            address,
-            (response['location']['y'], response['location']['x']),
-            response['address']
-        )
-        if exactly_one:
-            return location
-        else:
-            return [location]
-
-    def _authenticated_call_geocoder(
-        self, url, parse_callback, *, timeout=DEFAULT_SENTINEL
-    ):
-        if not self.username:
-            return self._call_geocoder(url, parse_callback, timeout=timeout)
-
-        def query_callback():
-            call_url = "&".join((url, urlencode({"token": self.token})))
-            headers = {"Referer": self.referer}
-            return self._call_geocoder(
-                call_url,
-                partial(maybe_reauthenticate_callback, from_token=self.token),
-                timeout=timeout,
-                headers=headers,
-            )
-
-        def maybe_reauthenticate_callback(response, *, from_token):
-            if "error" in response:
-                if response["error"]["code"] == self._TOKEN_EXPIRED:
-                    return self._refresh_authentication_token(
-                        query_retry_callback, timeout=timeout, from_token=from_token
-                    )
-            return parse_callback(response)
-
-        def query_retry_callback():
-            call_url = "&".join((url, urlencode({"token": self.token})))
-            headers = {"Referer": self.referer}
-            return self._call_geocoder(
-                call_url, parse_callback, timeout=timeout, headers=headers
-            )
-
-        if self.token is None or int(time()) > self.token_expiry:
-            return self._refresh_authentication_token(
-                query_callback, timeout=timeout, from_token=self.token
-            )
-        else:
-            return query_callback()
+        url = f"{url}&{urlencode(auth_params)}"
+        return self._call_geocoder(url, callback, timeout=timeout)
 
     @_synchronized
-    def _refresh_authentication_token(self, callback_success, *, timeout, from_token):
-        if from_token != self.token:
-            # Token has already been updated by a concurrent call.
-            return callback_success()
+    def _refresh_authentication_token(self):
+        """
+        Request an authentication token from ArcGIS.
+        """
+        assert self.username and self.password and self.referer
 
-        token_request_arguments = {
-            'username': self.username,
-            'password': self.password,
-            'referer': self.referer,
-            'expiration': self.token_lifetime,
-            'f': 'json'
-        }
-        url = "?".join((self.auth_api, urlencode(token_request_arguments)))
+        if not self.token_expiry or time() >= self.token_expiry:
+            # Get a new token
+            logger.debug("%s: Refreshing token", self.__class__.__name__)
+            response = self._call_geocoder(
+                self.auth_api,
+                self._parse_authentication_token,
+                method='POST',
+                headers={'Referer': self.referer},
+                post_data={
+                    'username': self.username,
+                    'password': self.password,
+                    'referer': self.referer,
+                    'f': 'json',
+                    'expiration': str(self.token_lifetime)
+                }
+            )
+            return response
+        return None
+
+    def _parse_authentication_token(self, response):
+        if 'error' in response:
+            raise GeocoderAuthenticationFailure(
+                str(response['error'])
+            )
+        self.token = response['token']
+        self.token_expiry = time() + self.token_lifetime
         logger.debug(
-            "%s._refresh_authentication_token: %s",
-            self.__class__.__name__, url
+            "%s: Refreshed token now expires at %s",
+            self.__class__.__name__,
+            self.token_expiry
         )
-
-        def cb(response):
-            if "token" not in response:
-                raise GeocoderAuthenticationFailure(
-                    "Missing token in auth request."
-                    "Request URL: %s; response JSON: %s" % (url, json.dumps(response))
-                )
-            self.token = response["token"]
-            self.token_expiry = int(time()) + self.token_lifetime
-            return callback_success()
-
-        return self._call_geocoder(url, cb, timeout=timeout)
+        return None

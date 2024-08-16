@@ -1,10 +1,8 @@
 import pytest
-
 from geopy import exc
 from geopy.geocoders import ArcGIS
 from geopy.point import Point
 from test.geocoders.util import BaseTestGeocoder, env
-
 
 class TestUnitArcGIS:
 
@@ -13,7 +11,6 @@ class TestUnitArcGIS:
             user_agent='my_user_agent/1.0'
         )
         assert geocoder.headers['User-Agent'] == 'my_user_agent/1.0'
-
 
 class TestArcGIS(BaseTestGeocoder):
 
@@ -84,7 +81,6 @@ class TestArcGIS(BaseTestGeocoder):
             {"address": "Atlantic Ocean"},
         )
 
-
 class TestArcGISAuthenticated(BaseTestGeocoder):
 
     @classmethod
@@ -102,3 +98,27 @@ class TestArcGISAuthenticated(BaseTestGeocoder):
             {"query": "Potsdamer Platz, Berlin, Deutschland"},
             {"latitude": 52.5094982, "longitude": 13.3765983, "delta": 4},
         )
+
+class TestArcGISToken(BaseTestGeocoder):
+
+    @classmethod
+    def make_geocoder(cls, **kwargs):
+        return ArcGIS(
+            token=env['ARCGIS_TOKEN'],
+            referer=env['ARCGIS_REFERER'],
+            timeout=3,
+            **kwargs
+        )
+
+    async def test_basic_address(self):
+        await self.geocode_run(
+            {"query": "Potsdamer Platz, Berlin, Deutschland"},
+            {"latitude": 52.5094982, "longitude": 13.3765983, "delta": 4},
+        )
+
+    async def test_reverse_point(self):
+        location = await self.reverse_run(
+            {"query": Point(40.753898, -73.985071)},
+            {"latitude": 40.75376406311989, "longitude": -73.98489005863667},
+        )
+        assert 'New York' in location.address
